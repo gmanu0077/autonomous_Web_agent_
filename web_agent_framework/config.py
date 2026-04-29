@@ -1,7 +1,9 @@
 """
 Configuration for the 3-Phase Autonomous Web Agent.
 
-Chroma DB: Used by RAG for Pydoll/Selenium code context. Required for planner step context.
+Chroma DB: Used for (1) Pydoll/Selenium code RAG (DB_DIR / COLLECTION_NAME) and
+(2) per-job DOM node embeddings under each job's node_rag/ folder (NODE_RAG_CHROMA_COLLECTION).
+
 MCP Server: Optional. When MCP_SERVER_URL is set, browser control uses MCP (Selenium/Pydoll via MCP).
 """
 import os
@@ -30,7 +32,7 @@ MCP_SERVER_URL = os.getenv("MCP_SERVER_URL", "")
 # LLM — choose provider and model. Edit here or set env vars (env overrides).
 # ---------------------------------------------------------------------------
 # Provider: "ollama" (local) or "gemini" (API)
-LLM_PROVIDER = os.getenv("LLM_PROVIDER", "GEMINI").lower()
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", "gemini").lower()
 if LLM_PROVIDER not in ("ollama", "gemini"):
     LLM_PROVIDER = "ollama"
 
@@ -40,11 +42,16 @@ if LLM_PROVIDER not in ("ollama", "gemini"):
 _DEFAULT_MODEL = {"ollama": "qwen3-coder:30b", "gemini": "gemini-flash-latest"}
 LLM_MODEL = os.getenv("LLM_MODEL", _DEFAULT_MODEL.get(LLM_PROVIDER, "qwen3-coder:30b"))
 
-# Gemini API key (required when LLM_PROVIDER=gemini). Get from: https://aistudio.google.com/apikey
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyAwJUVSY0VnNlhVAfOUWZ1JyFQwn16WyPU")
+# Gemini API key — set via environment or .env only (never commit real keys; leaked keys are revoked by Google).
+# https://aistudio.google.com/apikey
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", GEMINI_API_KEY)
 
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "nomic-embed-text")
+# Embedding model name:
+#   ollama:  nomic-embed-text (default)
+#   gemini:  gemini-embedding-001
+_DEFAULT_EMBED = {"ollama": "nomic-embed-text", "gemini": "models/gemini-embedding-001"}
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", _DEFAULT_EMBED.get(LLM_PROVIDER, "nomic-embed-text"))
 CHAT_MODEL_NAME = os.getenv("CHAT_MODEL_NAME", LLM_MODEL)
 PLANNER_MODEL = os.getenv("PLANNER_MODEL", LLM_MODEL)
 
@@ -54,6 +61,13 @@ TOP_K = int(os.getenv("TOP_K", "5"))
 
 TEMP_ROOT = os.getenv("TEMP_ROOT", DEFAULT_TEMP_ROOT)
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "3"))
+
+# Node RAG (DOM node embeddings per job): chroma (default) or faiss
+NODE_RAG_BACKEND = os.getenv("NODE_RAG_BACKEND", "chroma").lower()
+if NODE_RAG_BACKEND not in ("chroma", "faiss"):
+    NODE_RAG_BACKEND = "chroma"
+# Collection name for Chroma node index (stored under each job's node_rag/ folder)
+NODE_RAG_CHROMA_COLLECTION = os.getenv("NODE_RAG_CHROMA_COLLECTION", "dom_nodes")
 
 HTML_CHUNK_SIZE = int(os.getenv("HTML_CHUNK_SIZE", "1024"))
 HTML_CHUNK_OVERLAP = int(os.getenv("HTML_CHUNK_OVERLAP", "128"))

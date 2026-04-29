@@ -56,3 +56,11 @@ class GeminiAdapter:
             if match:
                 return json.loads(match.group(0))
             raise
+
+    async def embed(self, text: str, **kwargs) -> List[float]:
+        from ..config import EMBEDDING_MODEL
+        # Use config or provide a stable default
+        model = kwargs.get('model') or EMBEDDING_MODEL or 'models/gemini-embedding-001'
+        task_type = kwargs.get('task_type', 'retrieval_document')
+        res = genai.embed_content(model=model, content=text, task_type=task_type)
+        return res['embedding']

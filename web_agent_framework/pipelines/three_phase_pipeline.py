@@ -25,6 +25,7 @@ from ..core.graph_query import query_graph_for_step
 from ..adapters.pydoll_adapter import PydollBrowserAdapter
 from ..adapters.mcp import get_browser_adapter
 from ..adapters.llm_factory import get_llm_adapter
+from ..adapters.node_rag_factory import get_node_rag_adapter
 from ..agent.demand_planner import DemandPlanner
 from ..agent.step_generator import StepGenerator
 from ..agent.runner import Runner
@@ -135,6 +136,8 @@ class ThreePhaseState(TypedDict):
     result: str
     error: Optional[str]
     prepared_state: Optional[Dict[str, Any]]  # Pass-through when Phase 3 only
+    # Phase 3 routing from CLI: "action" = Pydoll plan/execute only; "chat" = Node RAG only; None = LLM intent
+    phase3_mode: Optional[str]
 
 
 # --- Phase 1 Nodes ---
@@ -379,6 +382,31 @@ async def build_dom_graph_node(state: ThreePhaseState) -> ThreePhaseState:
     }
 
 
+async def index_nodes_rag_node(state: ThreePhaseState) -> ThreePhaseState:
+    """Index graph nodes into NodeRAG for user queries."""
+    print("[Phase 1] Indexing nodes into NodeRAG...")
+    job_dir = state.get("job_dir")
+    if not job_dir:
+        return state
+        
+    rag_dir = os.path.join(job_dir, "node_rag")
+    rag = get_node_rag_adapter(rag_dir)
+    
+    # Use all nodes from graph
+    G = state.get("graph")
+    if G and G.nodes:
+        nodes = []
+        for n_id, data in G.nodes(data=True):
+            node = dict(data)
+            node["id"] = n_id
+            nodes.append(node)
+            
+        llm = get_llm_adapter()
+        await rag.index_nodes(nodes, llm)
+        
+    return state
+
+
 # --- Phase 1 conditional routing ---
 
 MAX_BLOCKER_RETRIES = 3
@@ -396,6 +424,57 @@ def route_after_verify(state: ThreePhaseState) -> str:
 
 
 # --- Phase 3 Nodes ---
+
+async def query_node_rag_node(state: ThreePhaseState) -> ThreePhaseState:
+    """Query NodeRAG with user demand and return answer."""
+    print("[Phase 3] Querying NodeRAG (chat mode)...")
+    user_demand = state.get("user_demand") or ""
+    prep = state.get("prepared_state") or state
+    job_dir = prep.get("job_dir") or state.get("job_dir") or ""
+
+    if not job_dir or not user_demand:
+        return state
+
+    rag_dir = os.path.join(job_dir, "node_rag")
+    nodes_index = os.path.join(rag_dir, "nodes_by_id.json")
+    if not os.path.isfile(nodes_index):
+        return {
+            **state,
+            "result": (
+                "No node index found for this job. Re-load the URL to re-run page analysis and indexing."
+            ),
+            "status": "completed",
+        }
+
+    rag = get_node_rag_adapter(rag_dir)
+    llm = get_llm_adapter()
+
+    # Query top-k nodes
+    top_nodes = await rag.query(user_demand, llm, k=10)
+
+    if not top_nodes:
+        return {**state, "result": "I couldn't find any relevant nodes for that question."}
+        
+    # Build prompt for LLM with full node data
+    nodes_str = json.dumps(top_nodes, indent=2)
+    prompt = f"""You are an AI assistant that answers questions about a web page's structure and content.
+You have been provided with the top 10 most relevant DOM nodes from the page based on the user's query.
+
+USER QUERY: {user_demand}
+
+RELEVANT NODES (JSON):
+{nodes_str}
+
+Based ONLY on the node data above, answer the user's query. If the data doesn't contain the answer, say so.
+Be specific and mention relevant tags, attributes, or text content when applicable.
+"""
+    try:
+        answer = await llm.generate(prompt)
+        return {**state, "result": answer, "status": "completed"}
+    except Exception as e:
+        print(f"[NodeRAG] Query failed: {e}")
+        return {**state, "result": f"Error querying NodeRAG: {e}"}
+
 
 async def plan_from_demand_node(state: ThreePhaseState) -> ThreePhaseState:
     """Demand-aware planning: LLM uses DOM graph + HTML to plan steps for user demand."""
@@ -572,6 +651,7 @@ def create_phase1_graph():
     workflow.add_node("clean_refetch", clean_html_refetch_node)
     workflow.add_node("expansion", content_expansion_redirect_guard_node)
     workflow.add_node("build_graph", build_dom_graph_node)
+    workflow.add_node("index_nodes", index_nodes_rag_node)
 
     workflow.set_entry_point("fetch")
     workflow.add_edge("fetch", "analyze_blockers")
@@ -580,17 +660,71 @@ def create_phase1_graph():
     workflow.add_conditional_edges("verify_blockers", route_after_verify)
     workflow.add_edge("clean_refetch", "expansion")
     workflow.add_edge("expansion", "build_graph")
-    workflow.add_edge("build_graph", END)
+    workflow.add_edge("build_graph", "index_nodes")
+    workflow.add_edge("index_nodes", END)
 
     return workflow.compile()
 
 
+async def detect_intent(state: ThreePhaseState) -> str:
+    """Route Phase 3: explicit CLI mode overrides LLM intent detection."""
+    mode = (state.get("phase3_mode") or "").strip().lower()
+    if mode == "chat":
+        return "query_rag"
+    if mode == "action":
+        return "plan"
+
+    user_demand = state.get("user_demand") or ""
+    if not user_demand:
+        return "plan"
+
+    llm = get_llm_adapter()
+    prompt = f"""Analyze the user's intent from their demand for a web agent.
+Is this a question seeking information *about* the current page content/structure (e.g. "what is the price?", "how many items are there?", "what are the node IDs for X?")
+OR is it a request for *action* (e.g. "click the buy button", "scroll to the bottom", "search for shoes").
+
+USER DEMAND: {user_demand}
+
+Return ONLY valid JSON (no markdown):
+{{"intent": "query" or "action"}}
+"""
+    try:
+        data = await llm.generate_json(prompt, system_prompt="You output only valid JSON.")
+        intent = data.get("intent", "action")
+        return "query_rag" if intent == "query" else "plan"
+    except Exception:
+        # Default to action if intent detection fails
+        return "plan"
+
+
+async def detect_intent_node(state: ThreePhaseState) -> ThreePhaseState:
+    """Node to update state with intent (for conditional edge)."""
+    # This node doesn't strictly need to do anything if we use a pure function for conditional edge,
+    # but some versions of langgraph prefer nodes.
+    return state
+
+
 def create_phase3_graph():
-    """Phase 3: Targeted Operation Execution."""
+    """Phase 3: Targeted Operation Execution (with intent detection and NodeRAG)."""
     workflow = StateGraph(ThreePhaseState)
+    workflow.add_node("detect_intent", detect_intent_node)
+    workflow.add_node("query_rag", query_node_rag_node)
     workflow.add_node("plan", plan_from_demand_node)
     workflow.add_node("execute", execute_step_with_verify_node)
-    workflow.set_entry_point("plan")
+
+    workflow.set_entry_point("detect_intent")
+    
+    # Conditional edge from detect_intent to either query_rag or plan
+    workflow.add_conditional_edges(
+        "detect_intent",
+        detect_intent, # Pure function
+        {
+            "query_rag": "query_rag",
+            "plan": "plan"
+        }
+    )
+    
+    workflow.add_edge("query_rag", END)
     workflow.add_edge("plan", "execute")
     workflow.add_edge("execute", END)
     return workflow.compile()
@@ -602,15 +736,22 @@ async def run_three_phase_agent(
     url: str,
     user_demand: Optional[str] = None,
     prepared_state: Optional[Dict[str, Any]] = None,
+    phase3_mode: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Run the 3-phase agent.
 
     - If user_demand is None: run Phase 1 only, return prepared state.
     - If user_demand and prepared_state: run Phase 3 only, return result.
+
+    phase3_mode: "action" (Pydoll plan/execute), "chat" (Node RAG only), or None (LLM intent routing).
     """
     job_id = datetime.now().strftime("%Y%m%d_%H%M%S")
-    job_dir = ensure_dir(os.path.join(TEMP_ROOT, f"job_{job_id}"))
+    # Phase 3 must reuse Phase 1 job_dir (graph, node_rag, steps).
+    if user_demand and prepared_state and prepared_state.get("job_dir"):
+        job_dir = str(prepared_state["job_dir"])
+    else:
+        job_dir = ensure_dir(os.path.join(TEMP_ROOT, f"job_{job_id}"))
 
     initial_state: ThreePhaseState = {
         "url": url,
@@ -628,6 +769,7 @@ async def run_three_phase_agent(
         "result": "",
         "error": None,
         "prepared_state": prepared_state,
+        "phase3_mode": phase3_mode,
     }
 
     if user_demand and prepared_state:

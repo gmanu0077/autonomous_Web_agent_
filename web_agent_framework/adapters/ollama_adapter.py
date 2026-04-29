@@ -44,3 +44,8 @@ class OllamaAdapter:
             if match:
                 return json.loads(match.group(0))
             raise
+
+    async def embed(self, text: str, **kwargs) -> List[float]:
+        from ..config import EMBEDDING_MODEL
+        res = ollama.embeddings(model=EMBEDDING_MODEL, prompt=text, **kwargs)
+        return res["embedding"]

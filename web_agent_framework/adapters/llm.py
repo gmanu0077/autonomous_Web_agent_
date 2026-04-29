@@ -9,3 +9,6 @@ class LLMAdapter(Protocol):
 
     async def generate_json(self, prompt: str, system_prompt: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         ...
+
+    async def embed(self, text: str, **kwargs) -> List[float]:
+        ...

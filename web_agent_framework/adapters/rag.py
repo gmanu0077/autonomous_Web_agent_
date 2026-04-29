@@ -1,6 +1,5 @@
 import os
 from typing import List, Dict, Any, Protocol
-import ollama
 import chromadb
 from chromadb.config import Settings
 from ..config import (
@@ -25,8 +24,11 @@ class ChromaOllamaRAG:
         self.embedding_model = EMBEDDING_MODEL
 
     def embed_text(self, text: str) -> List[float]:
-        res = ollama.embeddings(model=self.embedding_model, prompt=text)
-        return res["embedding"]
+        from .llm_factory import get_llm_adapter
+        import asyncio
+        llm = get_llm_adapter()
+        # ChromaOllamaRAG is synchronous, but llm.embed is async
+        return asyncio.run(llm.embed(text))
 
     def get_top_chunks(self, query: str, n_results: int = TOP_K) -> List[Dict[str, Any]]:
         if not os.path.isdir(self.db_dir):
